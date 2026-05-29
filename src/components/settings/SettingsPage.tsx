@@ -3,7 +3,7 @@ import { useSettingsStore } from "../../stores/settings-store";
 import { useGroupsStore } from "../../stores/groups-store";
 import { useHostsStore } from "../../stores/hosts-store";
 import { CustomSelect } from "../shared/CustomSelect";
-import { RefreshCw, CheckCircle2, AlertCircle, Download, Upload } from "lucide-react";
+import { RefreshCw, CheckCircle2, AlertCircle, Download, Upload, X } from "lucide-react";
 import type { CursorStyle } from "../../stores/settings-store";
 
 // ─── Shared styles ───────────────────────────────────────────────────────────
@@ -52,6 +52,19 @@ interface BackupImportResult {
   hostsUpdated: number;
   groupsCreated: number;
   groupsUpdated: number;
+}
+
+interface BackupImportPreview extends BackupImportResult {
+  hostsInBackup: number;
+  groupsInBackup: number;
+  hostsRemoved: number;
+  groupsRemoved: number;
+  secretsIncluded: boolean;
+}
+
+interface PendingBackupImport {
+  path: string;
+  preview: BackupImportPreview;
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────
@@ -268,7 +281,8 @@ function getErrorMessage(err: unknown, fallback: string): string {
 
 function BackupManager() {
   const [mode, setMode] = useState<BackupImportMode>("merge");
-  const [busy, setBusy] = useState<"export" | "import" | null>(null);
+  const [busy, setBusy] = useState<"export" | "preview" | "import" | null>(null);
+  const [pendingImport, setPendingImport] = useState<PendingBackupImport | null>(null);
   const [message, setMessage] = useState(
     "Export or import saved hosts and groups. Passwords stay in the OS keychain.",
   );
@@ -300,7 +314,7 @@ function BackupManager() {
   }, []);
 
   const importBackup = useCallback(async () => {
-    setBusy("import");
+    setBusy("preview");
     setIsError(false);
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
@@ -311,21 +325,34 @@ function BackupManager() {
       const path = Array.isArray(selected) ? selected[0] : selected;
       if (!path) return;
 
-      if (
-        mode === "replace" &&
-        !window.confirm(
-          "Replace all saved hosts and groups with this backup? Related history and port-forward rules for removed hosts may be removed.",
-        )
-      ) {
-        return;
-      }
-
       const { invoke } = await import("@tauri-apps/api/core");
-      const result = await invoke<BackupImportResult>("import_hosts_groups_backup", {
+      const preview = await invoke<BackupImportPreview>("preview_hosts_groups_backup", {
         path,
         mode,
       });
+      setPendingImport({ path, preview });
+      setMessage(`Ready to preview ${preview.hostsInBackup} hosts and ${preview.groupsInBackup} groups.`);
+    } catch (err) {
+      setIsError(true);
+      setMessage(getErrorMessage(err, "Failed to preview backup"));
+    } finally {
+      setBusy(null);
+    }
+  }, [mode]);
+
+  const confirmImport = useCallback(async () => {
+    if (!pendingImport) return;
+
+    setBusy("import");
+    setIsError(false);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const result = await invoke<BackupImportResult>("import_hosts_groups_backup", {
+        path: pendingImport.path,
+        mode: pendingImport.preview.mode,
+      });
       await Promise.all([loadHosts(), loadGroups()]);
+      setPendingImport(null);
 
       const action = result.mode === "replace" ? "Replaced" : "Merged";
       setMessage(
@@ -338,7 +365,7 @@ function BackupManager() {
     } finally {
       setBusy(null);
     }
-  }, [loadGroups, loadHosts, mode]);
+  }, [loadGroups, loadHosts, pendingImport]);
 
   return (
     <div className="px-4 py-3 rounded-lg bg-bg-surface border border-border/50">
@@ -377,10 +404,112 @@ function BackupManager() {
             className={mode === "replace" ? BUTTON_CLASS : PRIMARY_BUTTON_CLASS}
           >
             <Upload size={13} strokeWidth={2} />
-            {busy === "import" ? "Importing..." : "Import"}
+            {busy === "preview" ? "Reading..." : busy === "import" ? "Importing..." : "Import"}
           </button>
         </div>
       </div>
+
+      {pendingImport && (
+        <BackupPreviewModal
+          pendingImport={pendingImport}
+          busy={busy === "import"}
+          onCancel={() => setPendingImport(null)}
+          onConfirm={() => void confirmImport()}
+        />
+      )}
+    </div>
+  );
+}
+
+function BackupPreviewModal({ pendingImport, busy, onCancel, onConfirm }: {
+  pendingImport: PendingBackupImport;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const { preview } = pendingImport;
+  const isReplace = preview.mode === "replace";
+  const actionLabel = isReplace ? "Replace" : "Import";
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
+      <div className="w-full max-w-md rounded-lg border border-border bg-bg-surface shadow-[var(--shadow-lg)]">
+        <div className="flex items-center justify-between gap-4 border-b border-border/60 px-4 py-3">
+          <div>
+            <h3 className="text-[length:var(--text-sm)] font-semibold text-text-primary">
+              Import Preview
+            </h3>
+            <p className={DESC_CLASS}>
+              {isReplace ? "Replace current hosts and groups" : "Merge with current hosts and groups"}
+            </p>
+          </div>
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            className="p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+            aria-label="Close import preview"
+          >
+            <X size={15} strokeWidth={2} />
+          </button>
+        </div>
+
+        <div className="px-4 py-4">
+          <div className="grid grid-cols-2 gap-2">
+            <PreviewStat label="Hosts in file" value={preview.hostsInBackup} />
+            <PreviewStat label="Groups in file" value={preview.groupsInBackup} />
+            <PreviewStat label="New hosts" value={preview.hostsCreated} />
+            <PreviewStat label="Existing hosts" value={preview.hostsUpdated} />
+            <PreviewStat label="New groups" value={preview.groupsCreated} />
+            <PreviewStat label="Existing groups" value={preview.groupsUpdated} />
+          </div>
+
+          {isReplace && (
+            <div className="mt-3 rounded-lg border border-status-connecting/40 bg-status-connecting/10 px-3 py-2">
+              <p className="text-[length:var(--text-xs)] text-text-primary">
+                Replace will remove {preview.hostsRemoved} current hosts and {preview.groupsRemoved} current groups before import.
+              </p>
+              <p className={DESC_CLASS}>
+                Related history and port-forward rules for removed hosts may also be removed.
+              </p>
+            </div>
+          )}
+
+          <p className="mt-3 text-[length:var(--text-xs)] text-text-muted">
+            Passwords and key passphrases are not included in this backup.
+          </p>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-border/60 px-4 py-3">
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            className={BUTTON_CLASS}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={busy}
+            className={isReplace ? BUTTON_CLASS : PRIMARY_BUTTON_CLASS}
+          >
+            <Upload size={13} strokeWidth={2} />
+            {busy ? "Importing..." : actionLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PreviewStat({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-lg border border-border/50 bg-bg-base px-3 py-2">
+      <p className="text-[length:var(--text-lg)] font-semibold tabular-nums text-text-primary">
+        {value}
+      </p>
+      <p className="text-[length:var(--text-xs)] text-text-muted">
+        {label}
+      </p>
     </div>
   );
 }

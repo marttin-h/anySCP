@@ -5,8 +5,8 @@ use tokio::task;
 use tracing::instrument;
 
 use super::{
-    BackupExportResult, BackupImportMode, BackupImportResult, ConnectionHistoryEntry, DbError,
-    HostDb, HostGroup, RecentConnection, SavedHost,
+    BackupExportResult, BackupImportMode, BackupImportPreview, BackupImportResult,
+    ConnectionHistoryEntry, DbError, HostDb, HostGroup, RecentConnection, SavedHost,
 };
 
 /// Persist (insert or update) a host entry.
@@ -134,6 +134,22 @@ pub async fn import_hosts_groups_backup(
     task::spawn_blocking(move || {
         let path = PathBuf::from(path);
         db.import_hosts_groups_backup(&path, mode)
+    })
+    .await
+    .map_err(|e| DbError::InitError(format!("task panicked: {e}")))?
+}
+
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn preview_hosts_groups_backup(
+    path: String,
+    mode: BackupImportMode,
+    state: State<'_, Arc<HostDb>>,
+) -> Result<BackupImportPreview, DbError> {
+    let db = Arc::clone(&state);
+    task::spawn_blocking(move || {
+        let path = PathBuf::from(path);
+        db.preview_hosts_groups_backup(&path, mode)
     })
     .await
     .map_err(|e| DbError::InitError(format!("task panicked: {e}")))?

@@ -197,6 +197,21 @@ pub struct BackupImportResult {
     pub groups_updated: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupImportPreview {
+    pub mode: BackupImportMode,
+    pub hosts_in_backup: usize,
+    pub groups_in_backup: usize,
+    pub hosts_created: usize,
+    pub hosts_updated: usize,
+    pub groups_created: usize,
+    pub groups_updated: usize,
+    pub hosts_removed: usize,
+    pub groups_removed: usize,
+    pub secrets_included: bool,
+}
+
 impl Default for BackupImportMode {
     fn default() -> Self {
         Self::Merge
@@ -982,16 +997,7 @@ impl HostDb {
         path: &Path,
         mode: BackupImportMode,
     ) -> Result<BackupImportResult, DbError> {
-        let json = fs::read_to_string(path).map_err(|e| {
-            DbError::Backup(format!(
-                "could not read backup from {}: {e}",
-                path.display()
-            ))
-        })?;
-        let backup: HostsGroupsBackup = serde_json::from_str(&json)
-            .map_err(|e| DbError::Backup(format!("invalid backup JSON: {e}")))?;
-
-        Self::validate_hosts_groups_backup(&backup)?;
+        let backup = Self::read_hosts_groups_backup(path)?;
 
         let mut conn = self
             .conn
@@ -1053,6 +1059,74 @@ impl HostDb {
 
         tx.commit()?;
         Ok(result)
+    }
+
+    pub fn preview_hosts_groups_backup(
+        &self,
+        path: &Path,
+        mode: BackupImportMode,
+    ) -> Result<BackupImportPreview, DbError> {
+        let backup = Self::read_hosts_groups_backup(path)?;
+
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| DbError::InitError(format!("db lock poisoned: {e}")))?;
+        let tx = conn.transaction()?;
+
+        let current_hosts: i64 =
+            tx.query_row("SELECT COUNT(*) FROM saved_hosts", [], |row| row.get(0))?;
+        let current_groups: i64 =
+            tx.query_row("SELECT COUNT(*) FROM host_groups", [], |row| row.get(0))?;
+
+        let mut preview = BackupImportPreview {
+            mode,
+            hosts_in_backup: backup.data.hosts.len(),
+            groups_in_backup: backup.data.groups.len(),
+            secrets_included: backup.secrets.included,
+            ..BackupImportPreview::default()
+        };
+
+        if mode == BackupImportMode::Replace {
+            preview.hosts_created = backup.data.hosts.len();
+            preview.groups_created = backup.data.groups.len();
+            preview.hosts_removed = current_hosts as usize;
+            preview.groups_removed = current_groups as usize;
+            tx.rollback()?;
+            return Ok(preview);
+        }
+
+        for group in &backup.data.groups {
+            if Self::find_group_import_target(&tx, group)?.is_some() {
+                preview.groups_updated += 1;
+            } else {
+                preview.groups_created += 1;
+            }
+        }
+
+        for host in &backup.data.hosts {
+            if Self::find_host_import_target(&tx, host)?.is_some() {
+                preview.hosts_updated += 1;
+            } else {
+                preview.hosts_created += 1;
+            }
+        }
+
+        tx.rollback()?;
+        Ok(preview)
+    }
+
+    fn read_hosts_groups_backup(path: &Path) -> Result<HostsGroupsBackup, DbError> {
+        let json = fs::read_to_string(path).map_err(|e| {
+            DbError::Backup(format!(
+                "could not read backup from {}: {e}",
+                path.display()
+            ))
+        })?;
+        let backup: HostsGroupsBackup = serde_json::from_str(&json)
+            .map_err(|e| DbError::Backup(format!("invalid backup JSON: {e}")))?;
+        Self::validate_hosts_groups_backup(&backup)?;
+        Ok(backup)
     }
 
     fn validate_hosts_groups_backup(backup: &HostsGroupsBackup) -> Result<(), DbError> {
@@ -2047,6 +2121,60 @@ mod tests {
         assert_eq!(hosts[0].id, "local-host");
         assert_eq!(hosts[0].group_id.as_deref(), Some("local-group"));
         assert_eq!(hosts[0].notes.as_deref(), Some("from backup"));
+    }
+
+    #[test]
+    fn preview_hosts_groups_backup_reports_merge_counts_without_importing() {
+        let (db, dir) = test_db();
+
+        db.create_group(&HostGroup {
+            id: "local-group".to_string(),
+            name: "Shared".to_string(),
+            ..sample_group("local-group")
+        })
+        .expect("create local group");
+        db.save_host(&SavedHost {
+            id: "local-host".to_string(),
+            label: "Shared Host".to_string(),
+            host: "example.test".to_string(),
+            ..sample_host("local-host")
+        })
+        .expect("save local host");
+
+        let backup = HostsGroupsBackup {
+            format: BACKUP_FORMAT.to_string(),
+            version: BACKUP_VERSION,
+            exported_at_unix_seconds: 0,
+            data: HostsGroupsBackupData {
+                groups: vec![sample_group("new-group")],
+                hosts: vec![
+                    SavedHost {
+                        id: "backup-host".to_string(),
+                        label: "Shared Host".to_string(),
+                        host: "example.test".to_string(),
+                        ..sample_host("backup-host")
+                    },
+                    sample_host("new-host"),
+                ],
+            },
+            secrets: BackupSecretsInfo { included: false },
+        };
+        let path = dir.join("preview-backup.json");
+        std::fs::write(&path, serde_json::to_string(&backup).expect("serialize"))
+            .expect("write backup");
+
+        let preview = db
+            .preview_hosts_groups_backup(&path, BackupImportMode::Merge)
+            .expect("preview backup");
+
+        assert_eq!(preview.hosts_in_backup, 2);
+        assert_eq!(preview.groups_in_backup, 1);
+        assert_eq!(preview.hosts_updated, 1);
+        assert_eq!(preview.hosts_created, 1);
+        assert_eq!(preview.groups_created, 1);
+
+        let hosts = db.list_hosts().expect("list hosts");
+        assert_eq!(hosts.len(), 1, "preview must not import anything");
     }
 
     #[test]
