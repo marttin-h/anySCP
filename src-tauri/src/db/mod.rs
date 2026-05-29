@@ -1,8 +1,14 @@
 pub mod commands;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tracing::instrument;
 
 use crate::snippets::{Snippet, SnippetFolder, SnippetSearchResult};
@@ -21,6 +27,9 @@ pub enum DbError {
 
     #[error("Failed to initialize database: {0}")]
     InitError(String),
+
+    #[error("Backup error: {0}")]
+    Backup(String),
 }
 
 /// Serialize DbError as `{ kind, message }` so the frontend can pattern-match
@@ -36,6 +45,7 @@ impl Serialize for DbError {
             DbError::Sqlite(_) => "sqlite",
             DbError::NotFound(_) => "not_found",
             DbError::InitError(_) => "init_error",
+            DbError::Backup(_) => "backup",
         };
         state.serialize_field("kind", kind)?;
         state.serialize_field("message", &self.to_string())?;
@@ -134,6 +144,63 @@ pub struct HostGroup {
     pub default_username: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+const BACKUP_FORMAT: &str = "anyscp.backup.hosts-groups";
+const BACKUP_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupImportMode {
+    Merge,
+    Replace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostsGroupsBackup {
+    pub format: String,
+    pub version: u32,
+    pub exported_at_unix_seconds: u64,
+    pub data: HostsGroupsBackupData,
+    pub secrets: BackupSecretsInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostsGroupsBackupData {
+    pub groups: Vec<HostGroup>,
+    pub hosts: Vec<SavedHost>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupSecretsInfo {
+    pub included: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupExportResult {
+    pub path: String,
+    pub hosts: usize,
+    pub groups: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupImportResult {
+    pub mode: BackupImportMode,
+    pub hosts_created: usize,
+    pub hosts_updated: usize,
+    pub groups_created: usize,
+    pub groups_updated: usize,
+}
+
+impl Default for BackupImportMode {
+    fn default() -> Self {
+        Self::Merge
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -879,6 +946,288 @@ impl HostDb {
     }
 
     // -----------------------------------------------------------------------
+    // Hosts + Groups Backup
+    // -----------------------------------------------------------------------
+
+    pub fn export_hosts_groups_backup(&self, path: &Path) -> Result<BackupExportResult, DbError> {
+        let groups = self.list_groups()?;
+        let hosts = self.list_hosts()?;
+
+        let backup = HostsGroupsBackup {
+            format: BACKUP_FORMAT.to_string(),
+            version: BACKUP_VERSION,
+            exported_at_unix_seconds: Self::current_unix_seconds(),
+            data: HostsGroupsBackupData {
+                groups: groups.clone(),
+                hosts: hosts.clone(),
+            },
+            secrets: BackupSecretsInfo { included: false },
+        };
+
+        let json = serde_json::to_string_pretty(&backup)
+            .map_err(|e| DbError::Backup(format!("could not serialise backup: {e}")))?;
+        fs::write(path, json).map_err(|e| {
+            DbError::Backup(format!("could not write backup to {}: {e}", path.display()))
+        })?;
+
+        Ok(BackupExportResult {
+            path: path.display().to_string(),
+            hosts: hosts.len(),
+            groups: groups.len(),
+        })
+    }
+
+    pub fn import_hosts_groups_backup(
+        &self,
+        path: &Path,
+        mode: BackupImportMode,
+    ) -> Result<BackupImportResult, DbError> {
+        let json = fs::read_to_string(path).map_err(|e| {
+            DbError::Backup(format!(
+                "could not read backup from {}: {e}",
+                path.display()
+            ))
+        })?;
+        let backup: HostsGroupsBackup = serde_json::from_str(&json)
+            .map_err(|e| DbError::Backup(format!("invalid backup JSON: {e}")))?;
+
+        Self::validate_hosts_groups_backup(&backup)?;
+
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| DbError::InitError(format!("db lock poisoned: {e}")))?;
+        let tx = conn.transaction()?;
+
+        if mode == BackupImportMode::Replace {
+            tx.execute("DELETE FROM saved_hosts", [])?;
+            tx.execute("DELETE FROM host_groups", [])?;
+        }
+
+        let mut result = BackupImportResult {
+            mode,
+            ..BackupImportResult::default()
+        };
+        let mut group_id_map = HashMap::new();
+
+        for group in &backup.data.groups {
+            let target_id = if mode == BackupImportMode::Merge {
+                Self::find_group_import_target(&tx, group)?
+            } else {
+                None
+            };
+
+            let mut imported = group.clone();
+            if let Some(existing_id) = target_id {
+                imported.id = existing_id;
+                result.groups_updated += 1;
+            } else {
+                result.groups_created += 1;
+            }
+
+            group_id_map.insert(group.id.clone(), imported.id.clone());
+            Self::upsert_group_tx(&tx, &imported)?;
+        }
+
+        for host in &backup.data.hosts {
+            let target_id = if mode == BackupImportMode::Merge {
+                Self::find_host_import_target(&tx, host)?
+            } else {
+                None
+            };
+
+            let mut imported = host.clone();
+            if let Some(existing_id) = target_id {
+                imported.id = existing_id;
+                result.hosts_updated += 1;
+            } else {
+                result.hosts_created += 1;
+            }
+            imported.group_id = host
+                .group_id
+                .as_ref()
+                .and_then(|group_id| group_id_map.get(group_id).cloned());
+
+            Self::upsert_host_tx(&tx, &imported)?;
+        }
+
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn validate_hosts_groups_backup(backup: &HostsGroupsBackup) -> Result<(), DbError> {
+        if backup.format != BACKUP_FORMAT {
+            return Err(DbError::Backup(format!(
+                "unsupported backup format: {}",
+                backup.format
+            )));
+        }
+        if backup.version != BACKUP_VERSION {
+            return Err(DbError::Backup(format!(
+                "unsupported backup version: {}",
+                backup.version
+            )));
+        }
+
+        if backup
+            .data
+            .groups
+            .iter()
+            .any(|group| group.id.trim().is_empty())
+        {
+            return Err(DbError::Backup(
+                "backup contains a group without an id".into(),
+            ));
+        }
+        if backup
+            .data
+            .hosts
+            .iter()
+            .any(|host| host.id.trim().is_empty())
+        {
+            return Err(DbError::Backup(
+                "backup contains a host without an id".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn current_unix_seconds() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default()
+    }
+
+    fn find_group_import_target(
+        tx: &Transaction<'_>,
+        group: &HostGroup,
+    ) -> Result<Option<String>, DbError> {
+        tx.query_row(
+            "SELECT id
+             FROM host_groups
+             WHERE id = ?1 OR name = ?2
+             ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END
+             LIMIT 1",
+            params![group.id, group.name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DbError::from)
+    }
+
+    fn find_host_import_target(
+        tx: &Transaction<'_>,
+        host: &SavedHost,
+    ) -> Result<Option<String>, DbError> {
+        tx.query_row(
+            "SELECT id
+             FROM saved_hosts
+             WHERE id = ?1
+                OR (label = ?2 AND host = ?3 AND port = ?4 AND username = ?5)
+             ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END
+             LIMIT 1",
+            params![
+                host.id,
+                host.label,
+                host.host,
+                host.port as i64,
+                host.username
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DbError::from)
+    }
+
+    fn upsert_group_tx(tx: &Transaction<'_>, group: &HostGroup) -> Result<(), DbError> {
+        tx.execute(
+            "INSERT INTO host_groups (id, name, color, icon, sort_order, default_username, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                 name             = excluded.name,
+                 color            = excluded.color,
+                 icon             = excluded.icon,
+                 sort_order       = excluded.sort_order,
+                 default_username = excluded.default_username,
+                 updated_at       = excluded.updated_at",
+            params![
+                group.id,
+                group.name,
+                group.color,
+                group.icon,
+                group.sort_order,
+                group.default_username,
+                group.created_at,
+                group.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn upsert_host_tx(tx: &Transaction<'_>, host: &SavedHost) -> Result<(), DbError> {
+        tx.execute(
+            "INSERT INTO saved_hosts (
+                 id, label, host, port, username, auth_type, group_id, created_at, updated_at,
+                 key_path, color, notes, environment, os_type,
+                 startup_command, proxy_jump, keep_alive_interval, default_shell,
+                 font_size, last_connected_at, connection_count
+             )
+             VALUES (
+                 ?1,  ?2,  ?3,  ?4,  ?5,  ?6,  ?7,  ?8,  ?9,
+                 ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18,
+                 ?19, ?20, ?21
+             )
+             ON CONFLICT(id) DO UPDATE SET
+                 label                = excluded.label,
+                 host                 = excluded.host,
+                 port                 = excluded.port,
+                 username             = excluded.username,
+                 auth_type            = excluded.auth_type,
+                 group_id             = excluded.group_id,
+                 updated_at           = excluded.updated_at,
+                 key_path             = excluded.key_path,
+                 color                = excluded.color,
+                 notes                = excluded.notes,
+                 environment          = excluded.environment,
+                 os_type              = excluded.os_type,
+                 startup_command      = excluded.startup_command,
+                 proxy_jump           = excluded.proxy_jump,
+                 keep_alive_interval  = excluded.keep_alive_interval,
+                 default_shell        = excluded.default_shell,
+                 font_size            = excluded.font_size,
+                 last_connected_at    = excluded.last_connected_at,
+                 connection_count     = excluded.connection_count",
+            params![
+                host.id,
+                host.label,
+                host.host,
+                host.port,
+                host.username,
+                host.auth_type,
+                host.group_id,
+                host.created_at,
+                host.updated_at,
+                host.key_path,
+                host.color,
+                host.notes,
+                host.environment,
+                host.os_type,
+                host.startup_command,
+                host.proxy_jump,
+                host.keep_alive_interval,
+                host.default_shell,
+                host.font_size,
+                host.last_connected_at,
+                host.connection_count,
+            ],
+        )?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Snippet CRUD
     // -----------------------------------------------------------------------
 
@@ -1608,6 +1957,142 @@ mod tests {
         let (db, _dir) = test_db();
         let err = db.delete_group("ghost-group").expect_err("should fail");
         assert!(matches!(err, DbError::NotFound(_)));
+    }
+
+    #[test]
+    fn export_hosts_groups_backup_writes_json_without_secrets() {
+        let (db, dir) = test_db();
+        let group = sample_group("backup-group");
+        db.create_group(&group).expect("create_group");
+        db.save_host(&SavedHost {
+            group_id: Some(group.id.clone()),
+            ..sample_host("backup-host")
+        })
+        .expect("save_host");
+
+        let path = dir.join("backup.json");
+        let result = db.export_hosts_groups_backup(&path).expect("export backup");
+
+        assert_eq!(result.hosts, 1);
+        assert_eq!(result.groups, 1);
+
+        let json = std::fs::read_to_string(&path).expect("read backup");
+        let backup: HostsGroupsBackup = serde_json::from_str(&json).expect("parse backup");
+        assert_eq!(backup.format, BACKUP_FORMAT);
+        assert!(!backup.secrets.included);
+        assert_eq!(backup.data.hosts[0].id, "backup-host");
+        assert_eq!(backup.data.groups[0].id, "backup-group");
+    }
+
+    #[test]
+    fn import_hosts_groups_backup_merge_updates_matching_records() {
+        let (db, dir) = test_db();
+
+        db.create_group(&HostGroup {
+            id: "local-group".to_string(),
+            name: "Shared".to_string(),
+            color: "#111111".to_string(),
+            ..sample_group("local-group")
+        })
+        .expect("create local group");
+        db.save_host(&SavedHost {
+            id: "local-host".to_string(),
+            label: "Shared Host".to_string(),
+            host: "example.test".to_string(),
+            notes: Some("local".to_string()),
+            ..sample_host("local-host")
+        })
+        .expect("save local host");
+
+        let backup = HostsGroupsBackup {
+            format: BACKUP_FORMAT.to_string(),
+            version: BACKUP_VERSION,
+            exported_at_unix_seconds: 0,
+            data: HostsGroupsBackupData {
+                groups: vec![HostGroup {
+                    id: "backup-group".to_string(),
+                    name: "Shared".to_string(),
+                    color: "#222222".to_string(),
+                    ..sample_group("backup-group")
+                }],
+                hosts: vec![SavedHost {
+                    id: "backup-host".to_string(),
+                    label: "Shared Host".to_string(),
+                    host: "example.test".to_string(),
+                    notes: Some("from backup".to_string()),
+                    group_id: Some("backup-group".to_string()),
+                    ..sample_host("backup-host")
+                }],
+            },
+            secrets: BackupSecretsInfo { included: false },
+        };
+        let path = dir.join("merge-backup.json");
+        std::fs::write(&path, serde_json::to_string(&backup).expect("serialize"))
+            .expect("write backup");
+
+        let result = db
+            .import_hosts_groups_backup(&path, BackupImportMode::Merge)
+            .expect("import backup");
+
+        assert_eq!(result.groups_updated, 1);
+        assert_eq!(result.hosts_updated, 1);
+
+        let groups = db.list_groups().expect("list groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "local-group");
+        assert_eq!(groups[0].color, "#222222");
+
+        let hosts = db.list_hosts().expect("list hosts");
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].id, "local-host");
+        assert_eq!(hosts[0].group_id.as_deref(), Some("local-group"));
+        assert_eq!(hosts[0].notes.as_deref(), Some("from backup"));
+    }
+
+    #[test]
+    fn import_hosts_groups_backup_replace_clears_existing_records() {
+        let (db, dir) = test_db();
+
+        db.create_group(&sample_group("local-group"))
+            .expect("create local group");
+        db.save_host(&SavedHost {
+            group_id: Some("local-group".to_string()),
+            ..sample_host("local-host")
+        })
+        .expect("save local host");
+
+        let backup = HostsGroupsBackup {
+            format: BACKUP_FORMAT.to_string(),
+            version: BACKUP_VERSION,
+            exported_at_unix_seconds: 0,
+            data: HostsGroupsBackupData {
+                groups: vec![sample_group("backup-group")],
+                hosts: vec![SavedHost {
+                    group_id: Some("backup-group".to_string()),
+                    ..sample_host("backup-host")
+                }],
+            },
+            secrets: BackupSecretsInfo { included: false },
+        };
+        let path = dir.join("replace-backup.json");
+        std::fs::write(&path, serde_json::to_string(&backup).expect("serialize"))
+            .expect("write backup");
+
+        let result = db
+            .import_hosts_groups_backup(&path, BackupImportMode::Replace)
+            .expect("import backup");
+
+        assert_eq!(result.groups_created, 1);
+        assert_eq!(result.hosts_created, 1);
+
+        let groups = db.list_groups().expect("list groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "backup-group");
+
+        let hosts = db.list_hosts().expect("list hosts");
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].id, "backup-host");
+        assert_eq!(hosts[0].group_id.as_deref(), Some("backup-group"));
     }
 
     // -----------------------------------------------------------------------

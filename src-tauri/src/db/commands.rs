@@ -1,10 +1,13 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use tauri::State;
 use tokio::task;
 use tracing::instrument;
 
-use super::{ConnectionHistoryEntry, DbError, HostDb, HostGroup, RecentConnection, SavedHost};
+use super::{
+    BackupExportResult, BackupImportMode, BackupImportResult, ConnectionHistoryEntry, DbError,
+    HostDb, HostGroup, RecentConnection, SavedHost,
+};
 
 /// Persist (insert or update) a host entry.
 #[tauri::command]
@@ -101,6 +104,39 @@ pub async fn delete_group_with_hosts(
     task::spawn_blocking(move || db.delete_group_with_hosts(&id))
         .await
         .map_err(|e| DbError::InitError(format!("task panicked: {e}")))?
+}
+
+// ─── Hosts + Groups Backup ──────────────────────────────────────────────────
+
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn export_hosts_groups_backup(
+    path: String,
+    state: State<'_, Arc<HostDb>>,
+) -> Result<BackupExportResult, DbError> {
+    let db = Arc::clone(&state);
+    task::spawn_blocking(move || {
+        let path = PathBuf::from(path);
+        db.export_hosts_groups_backup(&path)
+    })
+    .await
+    .map_err(|e| DbError::InitError(format!("task panicked: {e}")))?
+}
+
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn import_hosts_groups_backup(
+    path: String,
+    mode: BackupImportMode,
+    state: State<'_, Arc<HostDb>>,
+) -> Result<BackupImportResult, DbError> {
+    let db = Arc::clone(&state);
+    task::spawn_blocking(move || {
+        let path = PathBuf::from(path);
+        db.import_hosts_groups_backup(&path, mode)
+    })
+    .await
+    .map_err(|e| DbError::InitError(format!("task panicked: {e}")))?
 }
 
 /// Record a successful connection for the given host id.  Also prunes the

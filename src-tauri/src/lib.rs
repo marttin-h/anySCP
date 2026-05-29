@@ -172,6 +172,8 @@ pub fn run() {
             db::commands::list_groups,
             db::commands::delete_group,
             db::commands::delete_group_with_hosts,
+            db::commands::export_hosts_groups_backup,
+            db::commands::import_hosts_groups_backup,
             // Connection history
             db::commands::record_connection,
             db::commands::list_recent_connections,

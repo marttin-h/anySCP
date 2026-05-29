@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { useSettingsStore } from "../../stores/settings-store";
+import { useGroupsStore } from "../../stores/groups-store";
+import { useHostsStore } from "../../stores/hosts-store";
 import { CustomSelect } from "../shared/CustomSelect";
-import { RefreshCw, CheckCircle2, AlertCircle, Download } from "lucide-react";
+import { RefreshCw, CheckCircle2, AlertCircle, Download, Upload } from "lucide-react";
 import type { CursorStyle } from "../../stores/settings-store";
 
 // ─── Shared styles ───────────────────────────────────────────────────────────
@@ -9,6 +11,25 @@ import type { CursorStyle } from "../../stores/settings-store";
 const LABEL_CLASS = "text-[length:var(--text-sm)] font-medium text-text-primary";
 const DESC_CLASS = "text-[length:var(--text-xs)] text-text-muted mt-0.5";
 
+const BUTTON_CLASS = [
+  "flex items-center gap-1.5 px-3 py-1.5 rounded-lg",
+  "text-[length:var(--text-sm)] font-medium whitespace-nowrap",
+  "bg-bg-base border border-border text-text-secondary",
+  "hover:text-text-primary hover:border-border-focus",
+  "transition-all duration-[var(--duration-fast)]",
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+  "disabled:opacity-60 disabled:pointer-events-none",
+].join(" ");
+
+const PRIMARY_BUTTON_CLASS = [
+  "flex items-center gap-1.5 px-3 py-1.5 rounded-lg",
+  "text-[length:var(--text-sm)] font-medium whitespace-nowrap",
+  "bg-accent text-text-inverse",
+  "hover:bg-accent-hover",
+  "transition-all duration-[var(--duration-fast)]",
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+  "disabled:opacity-60 disabled:pointer-events-none",
+].join(" ");
 
 const INPUT_CLASS = [
   "w-20 px-2.5 py-1.5 rounded-lg text-[length:var(--text-sm)] tabular-nums",
@@ -16,6 +37,22 @@ const INPUT_CLASS = [
   "outline-none focus:border-border-focus focus:ring-2 focus:ring-ring",
   "transition-[border-color,box-shadow] duration-[var(--duration-fast)]",
 ].join(" ");
+
+type BackupImportMode = "merge" | "replace";
+
+interface BackupExportResult {
+  path: string;
+  hosts: number;
+  groups: number;
+}
+
+interface BackupImportResult {
+  mode: BackupImportMode;
+  hostsCreated: number;
+  hostsUpdated: number;
+  groupsCreated: number;
+  groupsUpdated: number;
+}
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
@@ -155,6 +192,15 @@ export function SettingsPage() {
           </div>
         </section>
 
+        {/* Backup */}
+        <section className="mb-8">
+          <h2 className="text-[length:var(--text-sm)] font-semibold uppercase tracking-wider text-text-muted mb-4">
+            Backup
+          </h2>
+
+          <BackupManager />
+        </section>
+
         {/* Updates */}
         <section className="mb-8">
           <h2 className="text-[length:var(--text-sm)] font-semibold uppercase tracking-wider text-text-muted mb-4">
@@ -207,6 +253,135 @@ function Toggle({ id, checked, onChange }: { id: string; checked: boolean; onCha
         ].join(" ")}
       />
     </button>
+  );
+}
+
+// ─── Backup import/export ───────────────────────────────────────────────────
+
+function getErrorMessage(err: unknown, fallback: string): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object" && "message" in err) {
+    return String((err as { message: string }).message);
+  }
+  return fallback;
+}
+
+function BackupManager() {
+  const [mode, setMode] = useState<BackupImportMode>("merge");
+  const [busy, setBusy] = useState<"export" | "import" | null>(null);
+  const [message, setMessage] = useState(
+    "Export or import saved hosts and groups. Passwords stay in the OS keychain.",
+  );
+  const [isError, setIsError] = useState(false);
+
+  const loadHosts = useHostsStore((s) => s.loadHosts);
+  const loadGroups = useGroupsStore((s) => s.loadGroups);
+
+  const exportBackup = useCallback(async () => {
+    setBusy("export");
+    setIsError(false);
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const path = await save({
+        defaultPath: "anyscp-backup.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!path) return;
+
+      const { invoke } = await import("@tauri-apps/api/core");
+      const result = await invoke<BackupExportResult>("export_hosts_groups_backup", { path });
+      setMessage(`Exported ${result.hosts} hosts and ${result.groups} groups.`);
+    } catch (err) {
+      setIsError(true);
+      setMessage(getErrorMessage(err, "Failed to export backup"));
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const importBackup = useCallback(async () => {
+    setBusy("import");
+    setIsError(false);
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      if (!path) return;
+
+      if (
+        mode === "replace" &&
+        !window.confirm(
+          "Replace all saved hosts and groups with this backup? Related history and port-forward rules for removed hosts may be removed.",
+        )
+      ) {
+        return;
+      }
+
+      const { invoke } = await import("@tauri-apps/api/core");
+      const result = await invoke<BackupImportResult>("import_hosts_groups_backup", {
+        path,
+        mode,
+      });
+      await Promise.all([loadHosts(), loadGroups()]);
+
+      const action = result.mode === "replace" ? "Replaced" : "Merged";
+      setMessage(
+        `${action} ${result.hostsCreated} new hosts, ${result.hostsUpdated} existing hosts, ` +
+        `${result.groupsCreated} new groups, and ${result.groupsUpdated} existing groups.`,
+      );
+    } catch (err) {
+      setIsError(true);
+      setMessage(getErrorMessage(err, "Failed to import backup"));
+    } finally {
+      setBusy(null);
+    }
+  }, [loadGroups, loadHosts, mode]);
+
+  return (
+    <div className="px-4 py-3 rounded-lg bg-bg-surface border border-border/50">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <p className={LABEL_CLASS}>Hosts & Groups</p>
+          <p className={isError ? "text-[length:var(--text-xs)] text-status-error mt-0.5" : DESC_CLASS}>
+            {message}
+          </p>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 flex-wrap">
+          <CustomSelect
+            id="s-backup-mode"
+            value={mode}
+            onChange={(value) => setMode(value as BackupImportMode)}
+            options={[
+              { value: "merge", label: "Merge" },
+              { value: "replace", label: "Replace" },
+            ]}
+            className="w-28"
+          />
+
+          <button
+            onClick={() => void exportBackup()}
+            disabled={busy !== null}
+            className={BUTTON_CLASS}
+          >
+            <Download size={13} strokeWidth={2} />
+            {busy === "export" ? "Exporting..." : "Export"}
+          </button>
+
+          <button
+            onClick={() => void importBackup()}
+            disabled={busy !== null}
+            className={mode === "replace" ? BUTTON_CLASS : PRIMARY_BUTTON_CLASS}
+          >
+            <Upload size={13} strokeWidth={2} />
+            {busy === "import" ? "Importing..." : "Import"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
